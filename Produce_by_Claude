@@ -1,0 +1,1235 @@
+"""
+咖啡地块智能提取与灾害精算数据生成系统 FINAL
+══════════════════════════════════════════════════════════════
+基于 v5 架构，完全对接你的 Coffee_Data_Final_Export.csv
+
+CSV实际字段：
+  name / date / NDVI / VCI / B2 B3 B4 B5 B8 B11 B12
+  GNDVI / NDRE / SCL(均值，非像素) / country / .geo
+
+对比v5的变化：
+  [改-1] MonthlyTimeseries 直接从主CSV按name+month聚合
+          → GEE Script B 完全不需要跑
+  [改-2] SpectralIndices 新增真实NDBI（用B11，不再用-NDVI代理）
+          → 更准确排除裸地/建筑
+  [改-3] Layer-1 新增NDRE（红边指数）投票
+          → 更好区分咖啡（常绿乔木）vs 耕地
+  [改-4] S2_BAND 对应你CSV的波段导出顺序
+          → B2=1 B3=2 B4=3 B5=4 B8=5 B11=6 B12=7 SCL=8
+  [改-5] get_nearest_vci 使用date列精确时序匹配（已验证列存在）
+  [改-6] 经纬度从.geo列解析，用于UTM投影选择
+  [改-7] Layer-3地形CSV fallback 删除（你的CSV无elevation/slope列），
+          纯依赖DEM栅格；无栅格时此层跳过
+
+其余全部继承v5：
+  SCL像素掩膜 / WorldCover掩膜 / SAM2推理 / OOM重试
+  CRS自适应面积 / L4紧凑度 / 断点续跑 / 灾害等级
+══════════════════════════════════════════════════════════════
+"""
+
+import os, re, json, logging, warnings
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import rasterio
+import rasterio.crs
+from rasterio.features import shapes
+from rasterio.warp import calculate_default_transform, Resampling
+import geopandas as gpd
+from shapely.geometry import shape
+import torch
+
+try:
+    from scipy.stats import pearsonr
+    _SCIPY_OK = True
+except ImportError:
+    _SCIPY_OK = False
+    warnings.warn("scipy未安装，跳过皮尔森相关。pip install scipy")
+
+try:
+    from sam2.build_sam import build_sam2
+    from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+except ImportError as _e:
+    raise ImportError(
+        "找不到SAM2，请执行：\n"
+        "  pip install git+https://github.com/facebookresearch/sam2.git"
+    ) from _e
+
+warnings.filterwarnings("ignore", category=rasterio.errors.NotGeoreferencedWarning)
+
+
+# ══════════════════════════════════════════════════════════════
+# §0  ★★★ 路径配置 ★★★  ← 只需改这一节
+# ══════════════════════════════════════════════════════════════
+#
+# 本地运行（Windows）：保持反斜杠 r"..." 格式
+# Colab运行：改为 "/content/drive/MyDrive/..." 格式
+#
+# ┌─────────────────────────────────────────────────────────┐
+# │  必须修改的路径（共5处）                                  │
+# └─────────────────────────────────────────────────────────┘
+
+# [路径1] Sentinel-2 TIF文件所在目录
+TIF_DIR = r"C:\Users\hxz21\Desktop\coffee_tif_files_latest"
+
+# [路径2] 你的主CSV（Coffee_Data_Final_Export.csv）完整路径
+CSV_PATH = r"C:\Users\hxz21\Desktop\Coffee_Data_Final_Export.csv"
+
+# [路径3] 结果输出目录（不存在会自动创建）
+OUTPUT_DIR = r"E:\AHNU GIS Files\coffeefinance\Analysis_Results"
+
+# [路径4] SAM2模型权重文件完整路径
+SAM2_CHECKPOINT = r"C:\Users\hxz21\Desktop\sam2.1_hiera_base_plus.pt"
+
+# [路径5] SAM2配置文件路径（安装sam2后自动存在）
+#   本地：通常在 sam2 包安装目录下的 configs/sam2.1/
+#   Colab：import sam2; os.path.dirname(sam2.__file__) + "/configs/sam2.1/sam2.1_hiera_b+.yaml"
+MODEL_CFG = "configs/sam2.1/sam2.1_hiera_b+.yaml"
+
+# ┌─────────────────────────────────────────────────────────┐
+# │  GEE辅助数据路径（已下载才填，没下载留空字符串""）         │
+# └─────────────────────────────────────────────────────────┘
+
+# [路径6] GEE辅助数据目录（存放WorldCover/DEM/Slope分片或合并文件）
+# GEE自动分片时会生成 WorldCover_all-0000-0000.tif 等多个文件
+# 直接把所有分片放进此目录，代码自动找覆盖当前产区的分片，不需要合并
+AUX_DIR = r"E:\AHNU GIS Files\coffeefinance\AuxData"
+
+# 以下三个前缀对应GEE导出的文件名前缀，一般不需要改
+WORLDCOVER_PREFIX = "WorldCover_all"
+DEM_PREFIX        = "DEM_all"
+SLOPE_PREFIX      = "SLOPE_all"
+
+# ══════════════════════════════════════════════════════════════
+# §1  TIF波段顺序配置
+# ══════════════════════════════════════════════════════════════
+# ★ 用一行代码确认你的TIF实际波段数：
+#   import rasterio; src=rasterio.open("你的某个tif"); print(src.count, src.descriptions)
+#
+# 默认假设导出时波段顺序：B2 B3 B4 B8 SCL（5波段）
+# 若你导出了更多波段（如B5 B11 B12），按实际顺序修改下面数字
+
+S2_BAND: Dict[str, int] = {
+    "blue":     1,   # B2
+    "green":    2,   # B3
+    "red":      3,   # B4
+    "nir":      4,   # B8
+    "swir1":    5,   # B11  → 真实NDBI（gee_export_FINAL.js已导出）
+    "rededge":  6,   # B5   → NDRE（gee_export_FINAL.js已导出）
+    "scl":      7,   # SCL  → 像素级云掩膜
+    # 波段顺序由 gee_export_FINAL.js §2 selectBands() 固定
+    # 若你用其他脚本导出了不同顺序，按实际修改这里的数字
+}
+
+# ── TIF文件名中的id → CSV name列 映射表 ──────────────────────
+# TIF命名格式：S2_{id}_{year}_Q{n}.tif，如 S2_VN3_2023_Q2.tif
+# Python用id在文件名里匹配，再通过此表找到CSV的name列值
+ID_TO_CSVNAME: Dict[str, str] = {
+    "VN1": "多乐邦美蜀_EaTu",
+    "VN2": "林同大叻_CauDat",
+    "VN3": "嘉莱_ChưPrông",
+    "VN4": "得农_DakMil",
+    "VN5": "林同保禄_BaoLoc",
+    "YN1": "大开河_林润庄园",
+    "YN2": "新寨咖啡庄园",
+    "YN3": "怒江粒述庄园",
+    "YN4": "爱伲咖啡庄园",
+    "YN5": "宾川朱苦拉咖啡林",
+    "LA1": "巴松_PaksongA",
+    "LA2": "DaoHeuang",
+    "LA3": "Thateng",
+    "LA4": "DakCheung",
+    "LA5": "Champasak",
+    "JP1": "冲绳又吉",
+}
+SCL_SUFFIX:    Optional[str] = None  # SCL在独立文件时填后缀，如"_SCL.tif"
+SCL_VEGETATION = 4                   # SCL像素值：4=植被
+
+# SAM2推理参数
+SAM2_PARAMS: Dict[str, Any] = dict(
+    points_per_side=32,
+    pred_iou_thresh=0.80,
+    stability_score_thresh=0.90,
+    box_nms_thresh=0.70,
+    min_mask_region_area=100,
+)
+INITIAL_MAX_DIM = 2048  # RTX4060用2048；T4 Colab可用3072
+
+
+# ══════════════════════════════════════════════════════════════
+# §2  筛选阈值（一般不需要修改，调参时参考注释）
+# ══════════════════════════════════════════════════════════════
+
+AREA_MU_MIN = 0.5    # 最小地块面积（亩），低于此认为噪声
+AREA_MU_MAX = 500.0  # 超过此值标记为"需人工复核"
+
+# Layer-1 光谱投票阈值
+NDVI_MIN, NDVI_MAX = 0.25, 0.78  # 受灾旱季可降至0.18
+EVI_MIN,  EVI_MAX  = 0.15, 0.58  # 热带密林EVI>0.58
+NDWI_MAX           = 0.05        # 水体排除
+NDBI_MAX           = 0.05        # 建筑/裸地排除（需TIF有B11/SWIR）
+NDRE_MIN           = 0.05        # 红边指数下限，排除裸土（需TIF有B5红边）
+SPECTRAL_VOTE_MIN  = 2           # 4项中至少通过几项（调低=放宽）
+
+# Layer-2 时序阈值（直接使用Coffee_Data_Final_Export.csv的NDVI时序）
+COFFEE_TS_STD_MAX  = 0.14   # 年内NDVI标准差上限；水稻/玉米>0.20
+COFFEE_TS_CORR_MIN = 0.50   # 与咖啡参考曲线皮尔森r下限
+
+# Layer-3 地形阈值（需GEE DEM栅格文件；无文件时此层跳过）
+ELEV_MIN_M    = 200
+ELEV_MAX_M    = 2100
+SLOPE_MIN_DEG = 2
+SLOPE_MAX_DEG = 38
+
+# Layer-4 几何紧凑度
+COMPACTNESS_MIN = 0.12   # 天然林碎片通常<0.10
+
+# WorldCover白名单类别
+WORLDCOVER_VALID = {10, 20, 30}  # 乔木/灌木/草地
+
+# VCI灾害等级（FAO/NDMC标准）
+VCI_LEVELS: List[Tuple] = [
+    (0,  10, "极重灾", 0.95),
+    (10, 20, "重度灾", 0.75),
+    (20, 35, "中度灾", 0.50),
+    (35, 50, "轻度灾", 0.25),
+    (50, 75, "正常偏低", 0.0),
+    (75, 101, "良好",   0.0),
+]
+SQM_TO_MU = 1.0 / 666.67
+
+# 断点续跑记录文件
+CHECKPOINT_FILE = os.path.join(OUTPUT_DIR, "_processed_files.json")
+
+
+# ══════════════════════════════════════════════════════════════
+# §3  日志初始化
+# ══════════════════════════════════════════════════════════════
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(OUTPUT_DIR, "pipeline_final.log"),
+                            encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+    force=True,
+)
+log = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════
+# §4  通用工具函数
+# ══════════════════════════════════════════════════════════════
+
+def classify_vci(vci: float) -> Tuple[str, float]:
+    for lo, hi, label, coef in VCI_LEVELS:
+        if lo <= vci < hi:
+            return label, coef
+    return "数据异常", 0.0
+
+
+def normalize_to_uint8(band: np.ndarray, p_lo=2, p_hi=98) -> np.ndarray:
+    lo = float(np.nanpercentile(band, p_lo))
+    hi = float(np.nanpercentile(band, p_hi))
+    if hi == lo:
+        return np.zeros_like(band, dtype=np.uint8)
+    return np.clip((band.astype(np.float32) - lo) / (hi - lo) * 255.0,
+                   0, 255).astype(np.uint8)
+
+
+def get_metric_crs(lon: float, lat: float) -> str:
+    zone = int((lon + 180) / 6) + 1
+    return f"EPSG:326{zone:02d}" if lat >= 0 else f"EPSG:327{zone:02d}"
+
+
+def pixel_area_sqm(src: rasterio.DatasetReader) -> float:
+    crs = src.crs
+    if crs and crs.is_geographic:
+        b = src.bounds
+        t, _, _ = calculate_default_transform(
+            crs,
+            get_metric_crs((b.left + b.right) / 2, (b.bottom + b.top) / 2),
+            src.width, src.height,
+            left=b.left, bottom=b.bottom, right=b.right, top=b.top,
+        )
+        return float(abs(t.a)) ** 2
+    return float(abs(src.res[0])) ** 2
+
+
+def find_best_match(filename: str,
+                    name_list: List[str]) -> Optional[str]:
+    """
+    从TIF文件名中提取id（VN1/YN1等），
+    通过 ID_TO_CSVNAME 映射到 CSV 的 name 列。
+    文件名格式：S2_{id}_{year}_Q{n}.tif
+    """
+    # 匹配 VN1–VN5 / YN1–YN5 / LA1–LA5 / JP1 格式的id
+    m = re.search(r'\b(VN[1-5]|YN[1-5]|LA[1-5]|JP[1-9])\b', filename)
+    if m:
+        site_id = m.group(1)
+        csv_name = ID_TO_CSVNAME.get(site_id)
+        if csv_name and csv_name in name_list:
+            return csv_name
+    return None
+
+
+def extract_date_from_filename(filename: str) -> Optional[str]:
+    m = re.search(r"(\d{4}[-_]?\d{2}[-_]?\d{2})", filename)
+    if m:
+        raw = m.group(1).replace("-", "").replace("_", "")
+        try:
+            return datetime.strptime(raw, "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def get_nearest_vci(df: pd.DataFrame, name: str,
+                    img_date: Optional[str]) -> pd.Series:
+    """按时间最近原则匹配VCI记录，使用CSV实际date列"""
+    sub = df[df["name"] == name].copy()
+    if img_date and "date" in sub.columns:
+        try:
+            sub["_dt"] = pd.to_datetime(sub["date"])
+            sub["_diff"] = (sub["_dt"] - pd.to_datetime(img_date)).abs()
+            return sub.sort_values("_diff").iloc[0]
+        except Exception:
+            pass
+    return sub.iloc[0]
+
+
+def parse_geo_coords(geo_str: str) -> Tuple[float, float]:
+    """从.geo列JSON字符串解析经纬度，返回(lon, lat)"""
+    try:
+        geo = json.loads(geo_str)
+        coords = geo["coordinates"]
+        return float(coords[0]), float(coords[1])
+    except Exception:
+        return 100.0, 20.0  # 东南亚默认中心点fallback
+
+
+def build_geodataframe(mask_bool, transform, crs, plot_id,
+                       extra_attrs=None) -> Optional[gpd.GeoDataFrame]:
+    try:
+        geoms = [
+            shape(s) for s, v in
+            shapes(mask_bool.astype(np.int16), mask=mask_bool,
+                   transform=transform)
+            if v == 1
+        ]
+        if not geoms:
+            return None
+        attrs: Dict[str, Any] = {"plot_id": [plot_id] * len(geoms)}
+        if extra_attrs:
+            for k, val in extra_attrs.items():
+                attrs[k] = [val] * len(geoms)
+        gdf = gpd.GeoDataFrame(attrs, geometry=geoms, crs=crs)
+        return gdf.dissolve(by="plot_id").reset_index()
+    except Exception as e:
+        log.warning(f"    几何构建失败 [{plot_id}]: {e}")
+        return None
+
+
+def resize_array(arr: np.ndarray, h: int, w: int) -> np.ndarray:
+    if arr.shape == (h, w):
+        return arr
+    try:
+        import cv2
+        return cv2.resize(arr, (w, h), interpolation=cv2.INTER_LINEAR)
+    except ImportError:
+        ry = max(1, arr.shape[0] // h)
+        rx = max(1, arr.shape[1] // w)
+        return arr[::ry, ::rx][:h, :w]
+
+
+def mask_mean(arr: Optional[np.ndarray], mask: np.ndarray) -> float:
+    if arr is None:
+        return float("nan")
+    vals = arr[mask]
+    return float(np.nanmean(vals)) if len(vals) > 0 else float("nan")
+
+
+def load_checkpoint() -> set:
+    if os.path.exists(CHECKPOINT_FILE):
+        with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            return set(json.load(f))
+    return set()
+
+
+def save_checkpoint(processed: set) -> None:
+    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(processed), f, ensure_ascii=False)
+
+
+# ══════════════════════════════════════════════════════════════
+# §5  SCL像素掩膜（来自TIF波段，不是CSV的SCL均值列）
+# ══════════════════════════════════════════════════════════════
+
+def load_scl_mask(src: rasterio.DatasetReader,
+                  tif_path: str) -> Optional[np.ndarray]:
+    """
+    从TIF文件读取SCL像素级分类波段。
+    注意：CSV里的SCL列是产区中心点均值（~0.0004），
+    不是像素级分类，不能用于此处。
+    """
+    scl_arr = None
+    scl_band_idx = S2_BAND.get("scl")
+    if scl_band_idx and scl_band_idx <= src.count:
+        try:
+            scl_arr = src.read(scl_band_idx)
+            log.info(f"  🛰  SCL波段{scl_band_idx}，"
+                     f"唯一值: {np.unique(scl_arr).tolist()}")
+        except Exception as e:
+            log.warning(f"  ⚠️  SCL读取失败: {e}")
+
+    if scl_arr is None and SCL_SUFFIX:
+        scl_path = tif_path.replace(".tif", SCL_SUFFIX)
+        if os.path.exists(scl_path):
+            try:
+                with rasterio.open(scl_path) as ss:
+                    scl_arr = ss.read(1)
+                log.info(f"  🛰  SCL独立文件: {os.path.basename(scl_path)}")
+            except Exception as e:
+                log.warning(f"  ⚠️  独立SCL读取失败: {e}")
+
+    if scl_arr is None:
+        log.warning("  ⚠️  无SCL波段，退化为纯光谱筛选（精度降低）")
+        return None
+
+    veg_mask = (scl_arr == SCL_VEGETATION)
+    log.info(f"  📊 SCL植被像素占比: {veg_mask.mean() * 100:.1f}%")
+    return veg_mask.astype(bool)
+
+
+def apply_mask_to_rgb(rgb_u8: np.ndarray,
+                      mask: np.ndarray) -> np.ndarray:
+    """将掩膜外区域置黑，SAM2不在黑色区域生成segment"""
+    out = rgb_u8.copy()
+    out[~mask, :] = 0
+    return out
+
+
+
+# ══════════════════════════════════════════════════════════════
+# §5b  分片TIF查找工具（替代合并大文件）
+# ══════════════════════════════════════════════════════════════
+
+def find_covering_tile(prefix: str, ref_src: rasterio.DatasetReader,
+                       aux_dir: str) -> Optional[str]:
+    """
+    从 aux_dir 中找到所有以 prefix 开头的分片（prefix-XXXX-XXXX.tif），
+    返回与 ref_src 空间范围有重叠的第一个分片路径。
+    若有多个分片覆盖（跨分片边界），返回重叠面积最大的那个。
+    无重叠时返回 None（该产区不在此辅助数据覆盖范围内）。
+    """
+    import glob
+    from shapely.geometry import box
+
+    if not aux_dir or not os.path.isdir(aux_dir):
+        return None
+
+    # 收集所有分片（带编号后缀）和单一完整文件
+    tiles = sorted(glob.glob(os.path.join(aux_dir, f"{prefix}-*.tif")))
+    # 也兼容已合并的单文件
+    single = os.path.join(aux_dir, f"{prefix}.tif")
+    if os.path.exists(single):
+        return single   # 有合并文件直接用
+    if not tiles:
+        return None
+
+    # ref_src 的地理范围
+    b = ref_src.bounds
+    ref_box = box(b.left, b.bottom, b.right, b.top)
+
+    best_path  = None
+    best_area  = 0.0
+
+    for tile_path in tiles:
+        try:
+            with rasterio.open(tile_path) as t:
+                tb = t.bounds
+                tile_box = box(tb.left, tb.bottom, tb.right, tb.top)
+                if ref_box.intersects(tile_box):
+                    area = ref_box.intersection(tile_box).area
+                    if area > best_area:
+                        best_area = area
+                        best_path = tile_path
+        except Exception:
+            continue
+
+    return best_path
+
+
+# ══════════════════════════════════════════════════════════════
+# §6  WorldCover 土地利用掩膜
+# ══════════════════════════════════════════════════════════════
+
+class WorldCoverMask:
+    """
+    加载 WorldCover_all.tif，重采样到主TIF分辨率。
+    WORLDCOVER_FILE为空字符串时自动跳过。
+    """
+    _cache: Dict[str, Optional[np.ndarray]] = {}
+
+    @classmethod
+    def load(cls, site_name: str,
+             ref_src: rasterio.DatasetReader) -> Optional[np.ndarray]:
+        if site_name in cls._cache:
+            return cls._cache[site_name]
+        # 自动从分片目录找覆盖当前产区的分片（或合并文件）
+        tile_path = find_covering_tile(WORLDCOVER_PREFIX, ref_src, AUX_DIR)
+        if not tile_path:
+            log.warning("  [WorldCover] 未找到覆盖当前范围的分片，跳过")
+            cls._cache[site_name] = None
+            return None
+        try:
+            from rasterio.warp import reproject, Resampling as RS
+            with rasterio.open(tile_path) as aux:
+                dest = np.empty((ref_src.height, ref_src.width),
+                                dtype=np.uint8)
+                reproject(
+                    source=rasterio.band(aux, 1), destination=dest,
+                    src_transform=aux.transform, src_crs=aux.crs,
+                    dst_transform=ref_src.transform, dst_crs=ref_src.crs,
+                    resampling=RS.nearest,
+                )
+            valid = np.isin(dest, list(WORLDCOVER_VALID))
+            log.info(f"  🌍 WorldCover有效植被: {valid.mean()*100:.1f}% "
+                     f"[{os.path.basename(tile_path)}]")
+            cls._cache[site_name] = valid
+            return valid
+        except Exception as e:
+            log.warning(f"  [WorldCover] 读取失败: {e}")
+            cls._cache[site_name] = None
+            return None
+
+
+# ══════════════════════════════════════════════════════════════
+# §7  DEM / Slope 地形栅格
+# ══════════════════════════════════════════════════════════════
+
+class TerrainRaster:
+    """
+    加载 DEM_all.tif / SLOPE_all.tif，重采样到主TIF分辨率。
+    文件路径为空字符串或不存在时自动跳过（Layer-3跳过）。
+    """
+    _dem_cache:   Dict[str, Optional[np.ndarray]] = {}
+    _slope_cache: Dict[str, Optional[np.ndarray]] = {}
+
+    @classmethod
+    def load(cls, site_name: str, ref_src: rasterio.DatasetReader):
+        if site_name not in cls._dem_cache:
+            cls._dem_cache[site_name]   = cls._load_one(DEM_PREFIX,   ref_src, "DEM")
+            cls._slope_cache[site_name] = cls._load_one(SLOPE_PREFIX, ref_src, "Slope")
+        return cls._dem_cache[site_name], cls._slope_cache[site_name]
+
+    @staticmethod
+    def _load_one(prefix: str, ref_src: rasterio.DatasetReader,
+                  label: str) -> Optional[np.ndarray]:
+        # 自动从分片目录找覆盖当前产区的分片
+        tile_path = find_covering_tile(prefix, ref_src, AUX_DIR)
+        if not tile_path:
+            log.warning(f"  [{label}] 未找到覆盖当前范围的分片，跳过")
+            return None
+        try:
+            from rasterio.warp import reproject, Resampling as RS
+            with rasterio.open(tile_path) as aux:
+                dest = np.empty((ref_src.height, ref_src.width),
+                                dtype=np.float32)
+                dest.fill(np.nan)
+                reproject(
+                    source=rasterio.band(aux, 1), destination=dest,
+                    src_transform=aux.transform, src_crs=aux.crs,
+                    dst_transform=ref_src.transform, dst_crs=ref_src.crs,
+                    resampling=RS.bilinear,
+                )
+            log.info(f"  🏔  {label}: 均值={float(np.nanmean(dest)):.1f} "
+                     f"[{os.path.basename(tile_path)}]")
+            return dest
+        except Exception as e:
+            log.warning(f"  [{label}] 加载失败: {e}")
+            return None
+
+    @staticmethod
+    def mask_stats(raster, mask) -> Tuple[float, float]:
+        if raster is None:
+            return float("nan"), float("nan")
+        vals = raster[mask]
+        valid = vals[~np.isnan(vals)]
+        if len(valid) == 0:
+            return float("nan"), float("nan")
+        return float(np.mean(valid)), float(np.std(valid))
+
+
+# ══════════════════════════════════════════════════════════════
+# §8  月度时序（直接从主CSV聚合，不需要GEE Script B）
+# ══════════════════════════════════════════════════════════════
+
+class MonthlyTimeseries:
+    """
+    [改-1] 直接从 Coffee_Data_Final_Export.csv 按 name+month 聚合
+    月度NDVI曲线，替代原v5需要GEE Script B的设计。
+
+    原理：你的CSV已有2018–2025年每个产区的逐景NDVI，
+    按月份分组取均值即可得到月度代表曲线（比GEE导出更直接）。
+    """
+    # 咖啡常绿参考曲线（旱季略低，雨季略高，全年波动小）
+    _COFFEE_REF_CURVE = np.array([
+        -0.04, -0.03, -0.02, 0.01, 0.03, 0.04,
+         0.04,  0.03,  0.02, 0.01, -0.01, -0.03
+    ], dtype=np.float32)
+
+    def __init__(self, df_main: pd.DataFrame):
+        """
+        df_main: 已加载的完整CSV DataFrame
+        直接从中提取NDVI时序，无需额外文件。
+        """
+        self._site_curves: Dict[str, Dict] = {}
+        try:
+            df = df_main.copy()
+            df["_dt"]    = pd.to_datetime(df["date"], errors="coerce")
+            df["_month"] = df["_dt"].dt.month
+            self._data = df[["name", "_month", "NDVI", "VCI"]].dropna(
+                subset=["_month", "NDVI"])
+            log.info(f"  [MonthlyTS] 从主CSV聚合，有效记录: {len(self._data)} 行")
+        except Exception as e:
+            log.warning(f"  [MonthlyTS] 初始化失败: {e}")
+            self._data = None
+
+    def get_curve(self, site_name: str) -> Dict:
+        if site_name in self._site_curves:
+            return self._site_curves[site_name]
+
+        result = {
+            "ndvi_std": float("nan"), "n_valid": 0,
+            "corr_ndvi": float("nan"),
+        }
+
+        if self._data is None:
+            self._site_curves[site_name] = result
+            return result
+
+        sub = self._data[self._data["name"] == site_name]
+        if sub.empty:
+            log.warning(f"  [MonthlyTS] 产区 [{site_name}] 无记录")
+            self._site_curves[site_name] = result
+            return result
+
+        # 按月份聚合，取均值作为代表曲线
+        monthly = (sub.groupby("_month")["NDVI"]
+                   .mean()
+                   .reindex(range(1, 13)))  # 保证12个月齐全
+        ndvi_arr = monthly.values.astype(np.float32)
+        n_valid  = int(np.sum(~np.isnan(ndvi_arr)))
+
+        result["ndvi_std"] = float(np.nanstd(ndvi_arr))
+        result["n_valid"]  = n_valid
+
+        if _SCIPY_OK and n_valid >= 6:
+            valid_idx = ~np.isnan(ndvi_arr)
+            try:
+                r, _ = pearsonr(ndvi_arr[valid_idx],
+                                self._COFFEE_REF_CURVE[valid_idx])
+                result["corr_ndvi"] = float(r)
+            except Exception:
+                pass
+
+        self._site_curves[site_name] = result
+        return result
+
+
+# ══════════════════════════════════════════════════════════════
+# §9  光谱指数计算（新增真实NDBI和NDRE）
+# ══════════════════════════════════════════════════════════════
+
+class SpectralIndices:
+    """
+    从TIF文件读取波段计算指数。
+    [改-2] 新增真实NDBI（需B11/SWIR波段）
+    [改-3] 新增NDRE（需B5红边波段）
+    缺少对应波段时相关指数返回None，Layer-1自动跳过该项投票。
+    """
+    def __init__(self, src: rasterio.DatasetReader):
+        self._src = src
+        self._cache: Dict[str, Optional[np.ndarray]] = {}
+
+    def _read(self, key: str) -> Optional[np.ndarray]:
+        idx = S2_BAND.get(key)
+        if idx is None or idx > self._src.count:
+            return None
+        try:
+            return self._src.read(idx).astype(np.float32)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _ratio(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where((a + b) == 0.0, 0.0,
+                            (a - b) / (a + b)).astype(np.float32)
+
+    def ndvi(self) -> Optional[np.ndarray]:
+        """(NIR-Red)/(NIR+Red)"""
+        if "ndvi" not in self._cache:
+            nir, red = self._read("nir"), self._read("red")
+            self._cache["ndvi"] = (self._ratio(nir, red)
+                                   if nir is not None and red is not None
+                                   else None)
+        return self._cache["ndvi"]
+
+    def evi(self) -> Optional[np.ndarray]:
+        """2.5*(NIR-Red)/(NIR+6*Red-7.5*Blue+1)，基于地表反射率"""
+        if "evi" not in self._cache:
+            nir, red, blue = (self._read("nir"), self._read("red"),
+                              self._read("blue"))
+            if any(x is None for x in [nir, red, blue]):
+                self._cache["evi"] = None
+            else:
+                # S2 L2A：波段值已是地表反射率（0–1范围）
+                # 若你的TIF是DN值（0–10000），取消下面三行注释改用DN/10000
+                # nr, rr, br = nir/10000.0, red/10000.0, blue/10000.0
+                nr, rr, br = nir, red, blue
+                denom = nr + 6.0 * rr - 7.5 * br + 1.0
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    evi = np.where(denom == 0.0, 0.0,
+                                   2.5 * (nr - rr) / denom)
+                self._cache["evi"] = np.clip(evi, -1.0, 2.0).astype(
+                    np.float32)
+        return self._cache["evi"]
+
+    def ndwi(self) -> Optional[np.ndarray]:
+        """(Green-NIR)/(Green+NIR)，水体>0"""
+        if "ndwi" not in self._cache:
+            green, nir = self._read("green"), self._read("nir")
+            self._cache["ndwi"] = (self._ratio(green, nir)
+                                   if green is not None and nir is not None
+                                   else None)
+        return self._cache["ndwi"]
+
+    def ndbi(self) -> Optional[np.ndarray]:
+        """[改-2] (SWIR1-NIR)/(SWIR1+NIR)，建筑/裸地>0
+        需要TIF包含B11波段，S2_BAND中填 "swir1": N"""
+        if "ndbi" not in self._cache:
+            swir, nir = self._read("swir1"), self._read("nir")
+            self._cache["ndbi"] = (self._ratio(swir, nir)
+                                   if swir is not None and nir is not None
+                                   else None)
+        return self._cache["ndbi"]
+
+    def ndre(self) -> Optional[np.ndarray]:
+        """[改-3] (NIR-RedEdge)/(NIR+RedEdge)，常绿植被>0.2
+        需要TIF包含B5波段，S2_BAND中填 "rededge": N"""
+        if "ndre" not in self._cache:
+            nir, re = self._read("nir"), self._read("rededge")
+            self._cache["ndre"] = (self._ratio(nir, re)
+                                   if nir is not None and re is not None
+                                   else None)
+        return self._cache["ndre"]
+
+    def precompute_all(self):
+        self.ndvi(); self.evi(); self.ndwi(); self.ndbi(); self.ndre()
+
+    def resize_to(self, h: int, w: int):
+        for key in list(self._cache.keys()):
+            if self._cache[key] is not None:
+                self._cache[key] = resize_array(self._cache[key], h, w)
+
+
+# ══════════════════════════════════════════════════════════════
+# §10  CoffeeFilter 四层筛选器
+# ══════════════════════════════════════════════════════════════
+
+class CoffeeFilter:
+    def __init__(self, site_info: pd.Series,
+                 monthly_ts: MonthlyTimeseries,
+                 site_name: str,
+                 dem_arr: Optional[np.ndarray],
+                 slope_arr: Optional[np.ndarray]):
+        self.site       = site_info
+        self.monthly_ts = monthly_ts
+        self.site_name  = site_name
+        self.dem_arr    = dem_arr
+        self.slope_arr  = slope_arr
+
+    # ── L1: 多光谱指数投票 ────────────────────────────────
+    def layer1_spectral(self, si: SpectralIndices,
+                        mask: np.ndarray) -> Tuple[bool, str, Dict]:
+        scores: Dict[str, Any] = {}
+        votes = 0
+        total = 0
+
+        # NDVI
+        v = mask_mean(si.ndvi(), mask)
+        if not np.isnan(v):
+            total += 1
+            ok = NDVI_MIN <= v <= NDVI_MAX
+            if ok: votes += 1
+            scores.update({"ndvi": round(v, 3), "ndvi_ok": ok})
+
+        # EVI
+        v = mask_mean(si.evi(), mask)
+        if not np.isnan(v):
+            total += 1
+            ok = EVI_MIN <= v <= EVI_MAX
+            if ok: votes += 1
+            scores.update({"evi": round(v, 3), "evi_ok": ok})
+
+        # NDWI（排水体）
+        v = mask_mean(si.ndwi(), mask)
+        if not np.isnan(v):
+            total += 1
+            ok = v < NDWI_MAX
+            if ok: votes += 1
+            scores.update({"ndwi": round(v, 3), "ndwi_ok": ok})
+
+        # NDBI（排建筑/裸地）—— 需B11
+        v = mask_mean(si.ndbi(), mask)
+        if not np.isnan(v):
+            total += 1
+            ok = v < NDBI_MAX
+            if ok: votes += 1
+            scores.update({"ndbi": round(v, 3), "ndbi_ok": ok})
+
+        # NDRE（常绿植被验证）—— 需B5
+        v = mask_mean(si.ndre(), mask)
+        if not np.isnan(v):
+            total += 1
+            ok = v >= NDRE_MIN
+            if ok: votes += 1
+            scores.update({"ndre": round(v, 3), "ndre_ok": ok})
+
+        if total < SPECTRAL_VOTE_MIN:
+            return True, f"L1:跳过(仅{total}波段)", scores
+        passed = votes >= SPECTRAL_VOTE_MIN
+        tag = "✓" if passed else f"✗({votes}/{total}票)"
+        return passed, f"L1:光谱{tag}", scores
+
+    # ── L2: 时序NDVI（直接从主CSV聚合）──────────────────
+    def layer2_timeseries(self) -> Tuple[bool, str, Dict]:
+        scores: Dict[str, Any] = {}
+        curve = self.monthly_ts.get_curve(self.site_name)
+
+        if curve["n_valid"] < 6:
+            return True, "L2:跳过(月度样本不足)", scores
+
+        std = curve["ndvi_std"]
+        r   = curve["corr_ndvi"]
+        scores.update({
+            "ts_std":    round(std, 4),
+            "ts_n_mon":  curve["n_valid"],
+            "ts_corr_r": round(r, 3) if not np.isnan(r) else "nan",
+        })
+
+        fails = []
+        if not np.isnan(std) and std > COFFEE_TS_STD_MAX:
+            fails.append(f"std={std:.3f}>{COFFEE_TS_STD_MAX}")
+        if _SCIPY_OK and not np.isnan(r) and r < COFFEE_TS_CORR_MIN:
+            fails.append(f"r={r:.2f}<{COFFEE_TS_CORR_MIN}")
+
+        passed = len(fails) == 0
+        tag = "✓" if passed else f"✗({','.join(fails)})"
+        return passed, f"L2:时序{tag}", scores
+
+    # ── L3: 地形约束（纯栅格，无CSV fallback）────────────
+    def layer3_terrain(self,
+                       mask: np.ndarray) -> Tuple[bool, str, Dict]:
+        """
+        你的CSV无elevation/slope列，此层完全依赖DEM/Slope栅格。
+        栅格未下载时返回True（跳过），不影响其他层。
+        """
+        scores: Dict[str, Any] = {}
+        checks = []
+
+        if self.dem_arr is not None:
+            em, es = TerrainRaster.mask_stats(self.dem_arr, mask)
+            scores.update({"elev_mean_m": round(em, 1),
+                           "elev_std_m":  round(es, 1)})
+            if not np.isnan(em) and not (ELEV_MIN_M <= em <= ELEV_MAX_M):
+                checks.append(f"海拔{em:.0f}m越界")
+
+        if self.slope_arr is not None:
+            sm, _ = TerrainRaster.mask_stats(self.slope_arr, mask)
+            scores["slope_mean_deg"] = round(sm, 1)
+            if not np.isnan(sm) and not (SLOPE_MIN_DEG <= sm <= SLOPE_MAX_DEG):
+                checks.append(f"坡度{sm:.1f}°越界")
+
+        if not scores:
+            return True, "L3:跳过(无DEM栅格)", scores
+
+        passed = len(checks) == 0
+        tag = "✓" if passed else f"✗({','.join(checks)})"
+        return passed, f"L3:地形{tag}", scores
+
+    # ── L4: 几何紧凑度 ────────────────────────────────────
+    @staticmethod
+    def layer4_geometry(geom) -> Tuple[bool, str, Dict]:
+        try:
+            a, p = geom.area, geom.length
+            if p == 0:
+                return False, "L4:零周长✗", {}
+            c = (4.0 * np.pi * a) / (p ** 2)
+            passed = c >= COMPACTNESS_MIN
+            tag = "✓" if passed else f"✗({c:.3f}<{COMPACTNESS_MIN})"
+            return passed, f"L4:紧凑度{tag}", {"compactness": round(c, 4)}
+        except Exception as e:
+            return True, f"L4:跳过({e})", {}
+
+    # ── 综合评判 ──────────────────────────────────────────
+    def evaluate(self, ann: Dict, si: SpectralIndices,
+                 geom=None) -> Tuple[bool, str, Dict]:
+        mask = ann["segmentation"]
+        all_scores: Dict[str, Any] = {}
+        reasons: List[str] = []
+
+        for fn, args in [
+            (self.layer1_spectral, (si, mask)),
+            (self.layer2_timeseries, ()),
+            (self.layer3_terrain, (mask,)),
+        ]:
+            ok, reason, scores = fn(*args)
+            reasons.append(reason)
+            all_scores.update(scores)
+            if not ok:
+                return False, " | ".join(reasons), all_scores
+
+        if geom is not None:
+            ok, reason, scores = self.layer4_geometry(geom)
+            reasons.append(reason)
+            all_scores.update(scores)
+            if not ok:
+                return False, " | ".join(reasons), all_scores
+
+        return True, " | ".join(reasons), all_scores
+
+
+# ══════════════════════════════════════════════════════════════
+# §11  初始化模型与数据
+# ══════════════════════════════════════════════════════════════
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+log.info(f"🖥️  设备: {device}")
+
+log.info("加载 SAM2.1 hiera_base_plus...")
+sam2_model = build_sam2(MODEL_CFG, SAM2_CHECKPOINT, device=device)
+if device == "cuda":
+    sam2_model = sam2_model.half()
+    log.info("✅ FP16半精度已启用")
+mask_generator = SAM2AutomaticMaskGenerator(sam2_model, **SAM2_PARAMS)
+
+# 加载主CSV
+df_csv = pd.read_csv(CSV_PATH)
+df_csv.columns = df_csv.columns.str.strip()
+unique_names   = df_csv["name"].unique().tolist()
+log.info(f"✅ CSV加载完成 | 产区: {len(unique_names)} | 总记录: {len(df_csv)}")
+
+# [改-1] 月度时序直接从主CSV构建
+monthly_ts_db = MonthlyTimeseries(df_csv)
+
+# TIF文件列表
+tif_files = sorted([f for f in os.listdir(TIF_DIR) if f.endswith(".tif")])
+log.info(f"📂 TIF文件数: {len(tif_files)}")
+
+
+# ══════════════════════════════════════════════════════════════
+# §12  主处理循环
+# ══════════════════════════════════════════════════════════════
+
+processed_files = load_checkpoint()
+all_results: List[Dict] = []
+
+for tif_name in tif_files:
+
+    if tif_name in processed_files:
+        log.info(f"⏭️  跳过（已处理）: {tif_name}")
+        continue
+
+    log.info(f"\n{'═'*65}")
+    log.info(f"🔍 {tif_name}")
+
+    matched_name = find_best_match(tif_name, unique_names)
+    if not matched_name:
+        log.warning("⚠️  未识别产区名，跳过。（检查TIF文件名是否含CSV的name列值）")
+        continue
+
+    img_date          = extract_date_from_filename(tif_name)
+    site_info         = get_nearest_vci(df_csv, matched_name, img_date)
+    vci_val           = float(site_info["VCI"])
+    dis_label, coef   = classify_vci(vci_val)
+
+    # 从.geo列获取经纬度（用于UTM投影计算，不影响路径）
+    site_lon, site_lat = parse_geo_coords(str(site_info.get(".geo", "{}")))
+
+    log.info(f"✨ [{matched_name}] 日期:{img_date} | "
+             f"VCI:{vci_val:.1f} | {dis_label}")
+
+    tif_path = os.path.join(TIF_DIR, tif_name)
+
+    try:
+        with rasterio.open(tif_path) as src:
+            transform = src.transform
+            crs       = src.crs
+            px_sqm    = pixel_area_sqm(src)
+            log.info(f"  📐 单像素: {px_sqm:.4f} m² | 波段: {src.count}")
+
+            # 降采样
+            current_max_dim = INITIAL_MAX_DIM
+            scale  = min(current_max_dim / src.width,
+                         current_max_dim / src.height, 1.0)
+            out_h  = int(src.height * scale)
+            out_w  = int(src.width  * scale)
+
+            def read_rgb(h: int, w: int) -> np.ndarray:
+                raw = src.read(
+                    [S2_BAND["blue"], S2_BAND["green"], S2_BAND["red"]],
+                    out_shape=(3, h, w), resampling=Resampling.lanczos,
+                )
+                return np.stack(
+                    [normalize_to_uint8(raw[i]) for i in range(3)], axis=2)
+
+            rgb_u8 = read_rgb(out_h, out_w)
+
+            # SCL像素掩膜
+            scl_full = load_scl_mask(src, tif_path)
+            scl_r = (resize_array(scl_full.astype(np.uint8), out_h, out_w)
+                     .astype(bool)) if scl_full is not None else None
+
+            # WorldCover掩膜
+            wc_full = WorldCoverMask.load(matched_name, src)
+            wc_r = (resize_array(wc_full.astype(np.uint8), out_h, out_w)
+                    .astype(bool)) if wc_full is not None else None
+
+            # 合并掩膜
+            if scl_r is not None and wc_r is not None:
+                combined = scl_r & wc_r
+                log.info(f"  🔒 SCL∩WC有效: {combined.mean()*100:.1f}%")
+            elif scl_r is not None:
+                combined = scl_r
+            elif wc_r is not None:
+                combined = wc_r
+            else:
+                combined = None
+
+            if combined is not None:
+                rgb_u8 = apply_mask_to_rgb(rgb_u8, combined)
+
+            # 光谱指数
+            si = SpectralIndices(src)
+            si.precompute_all()
+            if scale < 1.0:
+                si.resize_to(out_h, out_w)
+
+            # DEM / Slope
+            dem_arr, slope_arr = TerrainRaster.load(matched_name, src)
+            if scale < 1.0:
+                if dem_arr   is not None:
+                    dem_arr   = resize_array(dem_arr,   out_h, out_w)
+                if slope_arr is not None:
+                    slope_arr = resize_array(slope_arr, out_h, out_w)
+
+            coffee_filter = CoffeeFilter(
+                site_info=site_info,
+                monthly_ts=monthly_ts_db,
+                site_name=matched_name,
+                dem_arr=dem_arr,
+                slope_arr=slope_arr,
+            )
+
+            # SAM2推理（OOM自动重试，最多3次）
+            masks = None
+            for _attempt in range(3):
+                try:
+                    log.info(f"🧠 SAM2.1推理 ({out_w}×{out_h},"
+                             f" 第{_attempt+1}次)...")
+                    masks = mask_generator.generate(rgb_u8)
+                    log.info(f"   原始候选: {len(masks)} 个")
+                    break
+                except torch.cuda.OutOfMemoryError:
+                    torch.cuda.empty_cache()
+                    current_max_dim = int(current_max_dim * 0.75)
+                    scale   = min(current_max_dim / src.width,
+                                  current_max_dim / src.height, 1.0)
+                    out_h   = int(src.height * scale)
+                    out_w   = int(src.width  * scale)
+                    log.warning(f"  ⚠️  OOM! 缩减至 {out_w}×{out_h} 重试")
+                    rgb_u8 = read_rgb(out_h, out_w)
+                    if combined is not None:
+                        cm_r   = resize_array(combined.astype(np.uint8),
+                                              out_h, out_w).astype(bool)
+                        rgb_u8 = apply_mask_to_rgb(rgb_u8, cm_r)
+                        combined = cm_r
+                    si.resize_to(out_h, out_w)
+                    if dem_arr   is not None:
+                        dem_arr   = resize_array(dem_arr,   out_h, out_w)
+                    if slope_arr is not None:
+                        slope_arr = resize_array(slope_arr, out_h, out_w)
+
+            if masks is None:
+                log.error(f"❌ [{tif_name}] 三次OOM均失败，跳过。")
+                processed_files.add(tif_name)
+                save_checkpoint(processed_files)
+                continue
+
+            # 4层筛选
+            reject: Dict[str, int] = {
+                "面积": 0, "SCL+WC": 0, "L1": 0,
+                "L2": 0, "L3": 0, "L4": 0,
+            }
+            valid_plots = 0
+            gpkg_saved  = 0
+
+            for i, ann in enumerate(masks):
+
+                real_px = ann["area"] / (scale ** 2)
+                area_mu = real_px * px_sqm * SQM_TO_MU
+                if area_mu < AREA_MU_MIN:
+                    reject["面积"] += 1
+                    continue
+
+                mask_bool = ann["segmentation"]
+
+                # SCL+WC纯度检查（地块内>70%需为有效植被像素）
+                if combined is not None:
+                    if combined[mask_bool].mean() < 0.70:
+                        reject["SCL+WC"] += 1
+                        continue
+
+                # 构建Shapely几何（L4紧凑度用）
+                geom_list = [
+                    shape(s) for s, v in
+                    shapes(mask_bool.astype(np.int16),
+                           mask=mask_bool, transform=transform)
+                    if v == 1
+                ]
+                geom = geom_list[0] if geom_list else None
+
+                # 4层联合筛选
+                is_coffee, reason, scores = coffee_filter.evaluate(
+                    ann, si, geom)
+
+                if not is_coffee:
+                    for lk in ["L1", "L2", "L3", "L4"]:
+                        seg = reason.split(f"{lk}:")
+                        if len(seg) > 1 and "✗" in seg[1].split("|")[0]:
+                            reject[lk] += 1
+                            break
+                    continue
+
+                valid_plots += 1
+                plot_id = f"{matched_name}_{i:04d}"
+
+                record: Dict[str, Any] = {
+                    "产区":            matched_name,
+                    "地块编号":        plot_id,
+                    "影像日期":        img_date or "未知",
+                    "面积_亩":         round(area_mu, 2),
+                    "VCI指数":         round(vci_val, 2),
+                    "灾害等级":        dis_label,
+                    "理赔触发系数":    coef,
+                    "估算受损面积_亩": round(area_mu * coef, 2),
+                    "置信度_IoU":      round(ann["predicted_iou"], 3),
+                    "稳定性分数":      round(ann["stability_score"], 3),
+                    "疑似大块_需复核": area_mu > AREA_MU_MAX,
+                    "筛选详情":        reason,
+                    "原始文件":        tif_name,
+                }
+                for k, v in scores.items():
+                    record[f"idx_{k}"] = v
+                all_results.append(record)
+
+                gdf = build_geodataframe(
+                    mask_bool, transform, crs, plot_id,
+                    extra_attrs={"vci":      round(vci_val, 2),
+                                 "disaster": dis_label,
+                                 "area_mu":  round(area_mu, 2)},
+                )
+                if gdf is not None:
+                    out_gpkg = os.path.join(OUTPUT_DIR, f"{plot_id}.gpkg")
+                    gdf.to_file(out_gpkg, driver="GPKG")
+                    gpkg_saved += 1
+
+            log.info(
+                f"✅ 有效地块:{valid_plots} | GPKG:{gpkg_saved}\n"
+                f"   拒绝 → 面积:{reject['面积']} "
+                f"SCL+WC:{reject['SCL+WC']} "
+                f"L1:{reject['L1']} L2:{reject['L2']} "
+                f"L3:{reject['L3']} L4:{reject['L4']}"
+            )
+
+    except Exception as e:
+        log.error(f"❌ [{tif_name}]: {e}", exc_info=True)
+
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
+    processed_files.add(tif_name)
+    save_checkpoint(processed_files)
+
+
+# ══════════════════════════════════════════════════════════════
+# §13  导出精算报表
+# ══════════════════════════════════════════════════════════════
+
+if all_results:
+    report_df = pd.DataFrame(all_results)
+
+    detail_path = os.path.join(OUTPUT_DIR, "Coffee_Actuarial_Detail_FINAL.csv")
+    report_df.to_csv(detail_path, index=False, encoding="utf_8_sig")
+    log.info(f"📄 明细表: {detail_path}")
+
+    base_agg: Dict[str, Tuple] = {
+        "影像日期":        ("影像日期",        "first"),
+        "地块数量":        ("地块编号",        "count"),
+        "总面积_亩":       ("面积_亩",         "sum"),
+        "平均面积_亩":     ("面积_亩",         "mean"),
+        "VCI指数":         ("VCI指数",         "first"),
+        "灾害等级":        ("灾害等级",        "first"),
+        "理赔触发系数":    ("理赔触发系数",    "first"),
+        "受损面积合计_亩": ("估算受损面积_亩", "sum"),
+        "需复核地块数":    ("疑似大块_需复核", "sum"),
+    }
+    for col_key, col_name in [
+        ("idx_ndvi",         "平均NDVI"),
+        ("idx_evi",          "平均EVI"),
+        ("idx_ndbi",         "平均NDBI"),
+        ("idx_ndre",         "平均NDRE"),
+        ("idx_compactness",  "平均紧凑度"),
+        ("idx_ts_std",       "平均时序Std"),
+        ("idx_ts_corr_r",    "平均时序相关r"),
+        ("idx_elev_mean_m",  "平均地块海拔m"),
+    ]:
+        if col_key in report_df.columns:
+            base_agg[col_name] = (col_key, "mean")
+
+    summary_df = report_df.groupby("产区").agg(**base_agg).reset_index()
+    summary_df["受损面积占比_%"] = (
+        summary_df["受损面积合计_亩"] / summary_df["总面积_亩"] * 100
+    ).round(2)
+
+    summary_path = os.path.join(OUTPUT_DIR,
+                                "Coffee_Actuarial_Summary_FINAL.csv")
+    summary_df.to_csv(summary_path, index=False, encoding="utf_8_sig")
+    log.info(f"📊 汇总表: {summary_path}")
+
+    show = ["产区", "地块数量", "总面积_亩", "灾害等级",
+            "受损面积合计_亩", "受损面积占比_%"]
+    print("\n" + "═" * 65)
+    print("📋 精算汇总（按产区）")
+    print("═" * 65)
+    print(summary_df[show].to_string(index=False))
+    print(f"\n🏆 完成！影像:{len(tif_files)} | "
+          f"有效地块:{len(report_df)} | "
+          f"产区:{report_df['产区'].nunique()}")
+
+else:
+    log.warning("💨 无结果，排查顺序：")
+    log.warning("  1. TIF文件名是否包含CSV的name列值（如'嘉莱_ChưPrông'）")
+    log.warning("  2. TIF波段数用 rasterio.open(tif).count 确认，"
+                "再对照§1的S2_BAND修改")
+    log.warning("  3. 降低 NDVI_MIN 至 0.18（受灾期咖啡NDVI偏低）")
+    log.warning("  4. 降低 SPECTRAL_VOTE_MIN 至 1（临时排查用）")
+    log.warning("  5. 降低 COMPACTNESS_MIN 至 0.08")
